@@ -1,0 +1,113 @@
+#! /bin/bash -e
+
+declare DESCRIPTION="Backup-gpg-tar-lftp Test cases"
+declare verbose=1
+
+inform() { if [ -n "$verbose" ]; then echo "$*"; fi; }
+fail() { echo "Error: $*"; exit 1; }
+header() { inform; inform "$1"; }
+
+test_1_incr_backup() {
+
+	export T=/tmp/backup-gpg-tar-lftp-test/1
+	export BACKUP_HOME=$T/.backup
+	export BACKUP_OUTPUT_DIRECTORY=$T/output
+	export BACKUP_ARCHIVES=RandomFiles
+	export BACKUP_FILES_RandomFiles=$T/randomfiles
+	mkdir -p "$T"
+	mkdir -p $T/randomfiles
+
+	header "Generate file1, backup, restore and compare"
+
+	dd if=/dev/urandom of=$T/randomfiles/file1 bs=1M count=1 status=none
+	./backup-gpg-tar-lftp save -d -t 001 RandomFiles
+	mkdir $T/restoration-1
+	gpg -q -d $BACKUP_OUTPUT_DIRECTORY/RandomFiles-001-full.tar.gz.gpg | tar -C $T/restoration-1 -xzv
+	cmp $T/randomfiles/file1 $T/restoration-1$T/randomfiles/file1
+
+	header "Generate file2, backup, restore and compare"
+
+	dd if=/dev/urandom of=$T/randomfiles/file2 bs=1M count=1 status=none
+	./backup-gpg-tar-lftp save -d -t 002 RandomFiles
+	mkdir $T/restoration-2
+	gpg -q -d $BACKUP_OUTPUT_DIRECTORY/RandomFiles-002.tar.gz.gpg | tar -C $T/restoration-2 -xzv
+	cmp $T/randomfiles/file2 $T/restoration-2$T/randomfiles/file2
+
+	header "Update file2, backup, restore and compare"
+
+	dd if=/dev/urandom of=$T/randomfiles/file2 bs=1M count=1 status=none
+	./backup-gpg-tar-lftp save -d -t 003
+	mkdir $T/restoration-3
+	gpg -q -d $BACKUP_OUTPUT_DIRECTORY/RandomFiles-003.tar.gz.gpg | tar -C $T/restoration-3 -xzv
+	cmp $T/randomfiles/file2 $T/restoration-3$T/randomfiles/file2
+
+	header  "Verifying contents of the archives..."
+
+	./backup-gpg-tar-lftp verify -v RandomFiles
+}
+
+test_2_full_backup() {
+
+	export T=/tmp/backup-gpg-tar-lftp-test/2
+	export BACKUP_HOME=$T/.backup
+	export BACKUP_OUTPUT_DIRECTORY=$T/output
+	export BACKUP_ARCHIVES=RandomFiles
+	export BACKUP_FILES_RandomFiles=$T/randomfiles
+	mkdir -p "$T"
+	mkdir -p $T/randomfiles
+
+	header "Creating file1, backup three times..."
+
+	dd if=/dev/urandom of=$T/randomfiles/file1 bs=1M count=1 status=none
+	./backup-gpg-tar-lftp save -d -t 001 -f
+	./backup-gpg-tar-lftp save -d -t 002 -f
+	./backup-gpg-tar-lftp save -d -t 003 -f
+
+	header "Checking archives..."
+
+	for encrypted_archive in $BACKUP_OUTPUT_DIRECTORY/RandomFiles-*-full.tar.gz.gpg; do
+		gpg -q -d $encrypted_archive | tar -C / -dz
+	done
+}
+
+main() {
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-k|--keep)
+				keep=1
+				shift
+				;;
+			-q|--quiet)
+				verbose=
+				shift
+				;;
+			-x|--xtrace)
+				set -x
+				shift
+				;;
+			-h|--help)
+				echo "Usage: $0 [-h|--help] [-x|--xtrace] [-q|--quiet]"
+				echo "$DESCRIPTION"
+				;;
+			*)
+				fail "Unknown parameter $1"
+				;;
+		esac
+	done
+
+	if [ "$PWD" != "$(readlink -f $0 | xargs dirname)" ]; then
+		fail "Change into directory before running"
+	fi
+
+	inform "Cleaning testroot..."
+	rm -rf /tmp/backup-gpg-tar-lftp-test/*
+
+	for testcase in ${@:-test_1_incr_backup test_2_full_backup}; do
+		header "Test case: $testcase..."
+		$testcase
+	done
+	inform "Success."
+}
+
+main "$@"

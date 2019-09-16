@@ -1,0 +1,259 @@
+#!/bin/bash -eu
+
+declare DESCRIPTION="GPG-Encrypted differential tar backup script."
+declare VERSION=$(git -C $(dirname $0) describe 2>/dev/null || echo "0.0")
+
+declare H="${BACKUP_HOME:-$HOME/.backup}"
+declare GPG_RECIPIENT="${BACKUP_GPG_RECIPIENT:-$USERNAME@$HOST}"
+declare OUTDIR="${BACKUP_OUTPUT_DIRECTORY:-$H/archives}"
+declare ARCHIVES="${BACKUP_ARCHIVES}"
+declare TS=$(date +%Y%m%d-%H%M%S)
+declare TARFLAGS="--exclude-vcs-ignores --exclude-ignore=.backupignore"
+declare VERBOSE=
+
+set -o pipefail
+
+inform() { if [ -n "$VERBOSE" ]; then echo "$*"; fi; }
+error() { echo "Error: $*" >&2; }
+fail() { echo "Error: $*"; exit 1; }
+
+save()
+{
+	declare full=
+	declare dry_run=
+	declare archive_names=()
+	declare dont_wait=
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-x|--xtrace)
+				set -x
+				shift
+				;;
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			-f|--full)
+				full=1
+				shift
+				;;
+			-n|--dry-run)
+				dry_run=1
+				shift
+				;;
+			-t|--timestamp)
+				TS=${2:?-t|--timestamp needs an argument.}
+				shift 2
+				;;
+			-o|--output-directory)
+				OUTDIR=${2:?--output needs an argument}
+				shift 2
+				;;
+			-d|--dont-wait)
+				dont_wait=1
+				shift
+				;;
+			-*)
+				fail "Unknown parameter $1"
+				;;
+			*)
+				archive_names+=($1)
+				shift
+				;;
+		esac
+	done
+
+	if [ ${#archive_names[@]} -eq 0 ]; then
+		inform "Backing up default directories '$ARCHIVES'..."
+		archive_names=($ARCHIVES)
+	fi
+
+	if [ -z "$dont_wait" ]; then
+		for i in {10..1}; do
+			echo -n "$i." && sleep 1;
+		done
+		echo
+	fi
+
+	for name in ${archive_names[@]}; do
+
+		[ -d $H/snapshots ] || mkdir -p $H/snapshots/
+		[ -d $H/tmp ] || mkdir -p $H/tmp
+
+		errlogfile=$H/tmp/$name-$TS.log
+		exec &> >( tee $errlogfile )
+
+		snaplast=$H/snapshots/$name-last
+		snapnext=$H/tmp/$name-$TS
+
+		if [ ! -e "$snaplast" ]; then
+			inform "No snapshot was found."
+			full=1
+		fi
+
+		if [ -n "$full" ] ; then
+			inform "Backup mode: full."
+		else
+			inform "Backup mode: differential."
+			cp $snaplast $snapnext
+		fi
+
+		outfile=$name-$TS${full:+-full}.tar.gz.gpg
+		inform "Backing up $name to $OUTDIR/$outfile..."
+
+		if which pigz >/dev/null; then
+			inform "Found pigz. Using it to compress. Awesome."
+			tarz="-I pigz"
+		else
+			tarz="-z"
+		fi
+
+		inform "Will hide directories from output. (lines ending with /)"
+
+		filesv=BACKUP_FILES_$name
+		files=${!filesv}
+		tar -c $tarz -v -g $snapnext -C / $files 2> >( grep -v -e '/$' >&2) |
+			gpg -r $GPG_RECIPIENT -e |
+			if [ -n "$dry_run" ]; then
+				cat >/dev/null
+			elif grep '^sftp://' <<<"$OUTDIR"; then
+				lftp $OUTDIR -e "put /dev/stdin -o $outfile"
+			else
+				[ -d $OUTDIR ] || mkdir -p $OUTDIR
+				cat >$OUTDIR/$outfile
+			fi
+
+		if [ -n "$dry_run" ]; then
+			rm $snapnext
+		else
+			inform "Committing snapshot $H/snapshots/$(basename $snapnext)"
+			mv $snapnext $H/snapshots/
+			ln -sf $(basename $snapnext) $H/snapshots/$name-last
+
+		fi
+
+		mv $errlogfile $H/snapshots/
+	
+		inform "Done saving $name."
+
+	done
+
+}
+
+vfs() {
+	case $1 in
+		ls)
+			if grep '^sftp://' <<<"$2"; then
+				# remove ./ that lftp adds
+				lftp $2 -e 'find; exit' | sed 's/^.\///g'
+			else
+				ls -1 $2
+			fi
+			;;
+		cat)
+			if grep '^sftp://' <<<"$2"; then
+				lftp "$(dirname $2)" -e "cat '$(basename $2)'; exit"
+			else
+				cat $2
+			fi
+			;;
+		*)
+			fail "Unknown subcommand in ${FUNCNAME[0]} $1."
+			;;
+	esac
+}
+
+verify()
+{
+	declare archive_names=()
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-x)
+				set -x
+				shift
+				;;
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			-*)
+				fail "Unknown parameter $1"
+				;;
+			*)
+				archive_names+=($1)
+				shift
+				;;
+		esac
+	done
+
+	if [ ${#archive_names[@]} -eq 0 ]; then
+		inform "Using default directories '$ARCHIVES'..."
+		archive_names=("$ARCHIVES")
+	fi
+
+	for name in ${archive_names[@]}; do
+
+		inform "Checking archive $name..."
+
+		files=$(vfs ls $OUTDIR)
+		archive_files=$(grep -e "^$name" <<<"$files" | sort )
+
+		inform "Found Archives:"
+		inform "$archive_files"
+
+		declare -A lastmodified
+
+		for archive_file in $archive_files; do
+			inform "Reading last modification dates from $OUTDIR/$archive_file..."
+			while read perm user size date time path; do
+				lastmodified[$path]="$date-$time"
+			done < <( vfs cat $OUTDIR/$archive_file | gpg -q -d | tar -ztv )
+		done
+
+		inform "Comparing last modification dates..."
+
+		for path in "${!lastmodified[@]}"; do
+			backup="${lastmodified[$path]}"
+			actual="$(date -d "@$(stat -c %X /$path)" +%Y-%m-%d-%H:%M)"
+			if [ "$backup" != "$actual" ]; then
+				error "/$path last modification time differs backup:$backup actual:$actual"
+			else
+				inform "/$path is recent"
+			fi
+		done
+	done
+}
+
+declare unparsed_args=()
+while [ $# -gt 0 ]; do
+	case $1 in
+		-V|--version)
+			echo $(basename $0) $VERSION;
+			exit
+			;;
+		-h|--help)
+			echo "$BASH_SOURCE [-h|--help] [-V|--version] [SUBCOMMAND]"
+			echo "$DESCRIPTION"
+			echo
+			echo "Where SUBCOMMAND is one of:"
+			echo "  save   [-v|--verbose] [-x|--xtrace] [-t|--timestamp] [-f|--full] [-n|--dry-run] [-o|--output-directory PATH][ARCHIVES]"
+			echo "  verify [-v|--verbose] [-x|--xtrace] [ARCHIVES]"
+			exit
+			;;
+		*)
+			unparsed_args+=("$1")
+			shift
+			;;
+	esac
+done
+set -- "${unparsed_args[@]}"
+
+case ${1:?Error: Missing subcommand.} in
+	save|verify)
+		"$@"
+		;;
+	*)
+		fail "Unknown command $1."
+		;;
+esac
