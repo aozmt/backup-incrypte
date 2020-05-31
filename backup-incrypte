@@ -1,0 +1,348 @@
+#!/bin/bash -eu
+
+# Incrypte backup script
+# Copyright (C) 2020 aoz@ib-oezmert.de
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program.  If not, see <https://www.gnu.org/licenses/>.
+
+declare DESCRIPTION="Bash shell script for *incr*emental, en*crypt*ed and \
+remo*te* backup suitable for the 3-2-1 backup strategy"
+declare VERSION=$(git -C $(dirname $0) describe 2>/dev/null || echo "0.0")
+
+declare BHOME="${BACKUP_HOME:-$HOME/.backup}"
+declare GPG_RECIPIENT="${BACKUP_GPG_RECIPIENT:-$USERNAME@$HOST}"
+declare OUTDIR="${BACKUP_OUTPUT_DIRECTORY:-$BHOME/archives}"
+declare MIRROR="${BACKUP_MIRROR}"
+declare ARCHIVES="${BACKUP_ARCHIVES}"
+declare TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+declare TARFLAGS="--exclude-vcs-ignores --exclude-ignore=.backupignore"
+declare VERBOSE=
+
+set -o pipefail
+
+inform() { echo "$*"; }
+inform-v() { if [ -n "$VERBOSE" ]; then echo "$*" ; fi; }
+inform-vv() { if [ "$VERBOSE" -eq 2 ]; then echo "$*" ; fi; }
+error() { echo "Error: $*" >&2; }
+fail() { echo "Error: $*" >&2; exit 1; }
+
+save()
+{
+	declare full=
+	declare dry_run=
+	declare archive_names=()
+	declare dont_wait=
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			-f|--full)
+				full=1
+				shift
+				;;
+			-n|--dry-run)
+				dry_run=1
+				shift
+				;;
+			-t|--timestamp)
+				TIMESTAMP=${2:?-t|--timestamp needs an argument.}
+				shift 2
+				;;
+			-o|--output-directory)
+				OUTDIR=${2:?--output needs an argument}
+				shift 2
+				;;
+			-m|--mirror)
+				MIRROR=${2:?--output needs an argument}
+				shift 2
+				;;
+			-d|--dont-wait)
+				dont_wait=1
+				shift
+				;;
+			-*)
+				fail "Unknown parameter $1"
+				;;
+			*)
+				archive_names+=($1)
+				shift
+				;;
+		esac
+	done
+
+	if [ ${#archive_names[@]} -eq 0 ]; then
+		inform-v "Backing up default directories $ARCHIVES..."
+		archive_names=($ARCHIVES)
+	fi
+
+	if [ -z "$dont_wait" ]; then
+		for i in {10..1}; do
+			echo -n "$i." && sleep 1;
+		done
+		echo
+	fi
+
+	for name in ${archive_names[@]}; do
+
+		[ -d $BHOME/snapshots ] || mkdir -p $BHOME/snapshots/
+		[ -d $BHOME/tmp ] || mkdir -p $BHOME/tmp
+
+		errlogfile=$BHOME/tmp/$name-$TIMESTAMP.log
+		exec &> >( tee $errlogfile )
+
+		snaplast=$BHOME/snapshots/$name-last
+		snapnext=$BHOME/tmp/$name-$TIMESTAMP
+
+		if [ ! -e "$snaplast" ]; then
+			inform-v "No snapshot was found."
+			full=1
+		fi
+
+		if [ -n "$full" ] ; then
+			inform-v "Backup mode: full."
+		else
+			inform-v "Backup mode: differential."
+			cp $snaplast $snapnext
+		fi
+
+		outfile=$name-$TIMESTAMP${full:+-full}.tar.gz.gpg
+		inform "Backing up $name to $OUTDIR/$outfile..."
+
+		if which pigz >/dev/null; then
+			inform-v "Found pigz. Using it to compress. Awesome."
+			tarz="-I pigz"
+		else
+			tarz="-z"
+		fi
+
+		inform-v "Will hide directories from output. (lines ending with /)"
+
+		filesv=BACKUP_FILES_$name
+		files=${!filesv}
+
+		targpg="tar -c $tarz -v -g $snapnext -C / $files 2> >( grep -v -e '/$' >&2) | gpg -r $GPG_RECIPIENT -e"
+
+		if [ -n "$dry_run" ]; then
+			bash ${VERBOSE:+-v} <<-EOF
+				$targpg | cat >/dev/null
+			EOF
+		elif grep '^sftp://' <<<"$OUTDIR"; then
+			bash ${VERBOSE:+-v} <<-EOF
+				$targpg | lftp $OUTDIR -e "put /dev/stdin -o $outfile"
+			EOF
+		else
+			[ -d $OUTDIR ] || mkdir -p $OUTDIR
+			bash ${VERBOSE:+-v} <<-EOF
+				$targpg | cat >$OUTDIR/$outfile
+			EOF
+		fi
+
+		if [ -n "$dry_run" ]; then
+			rm $snapnext
+		else
+			inform-v "Committing snapshot $BHOME/snapshots/$(basename $snapnext)"
+			bash ${VERBOSE:+-v} <<-EOF
+				 mv $snapnext $BHOME/snapshots/
+				 ln -sf $(basename $snapnext) $BHOME/snapshots/$name-last
+			EOF
+		fi
+
+		mv $errlogfile $BHOME/snapshots/
+
+		inform "Done saving $name."
+
+	done
+
+}
+
+vfs() {
+	case $1 in
+		ls)
+			if grep '^sftp://' <<<"$2"; then
+				# remove ./ that lftp adds
+				lftp $2 -e 'find; exit' | sed 's/^.\///g'
+			else
+				ls -1 $2
+			fi
+			;;
+		cat)
+			if grep '^sftp://' <<<"$2"; then
+				lftp "$(dirname $2)" -e "cat '$(basename $2)'; exit"
+			else
+				cat $2
+			fi
+			;;
+		*)
+			fail "Unknown subcommand in ${FUNCNAME[0]} $1."
+			;;
+	esac
+}
+
+verify()
+{
+	declare archive_names=()
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			-*)
+				fail "Unknown parameter $1"
+				;;
+			*)
+				archive_names+=($1)
+				shift
+				;;
+		esac
+	done
+
+	if [ ${#archive_names[@]} -eq 0 ]; then
+		inform-v "Using default directories $ARCHIVES..."
+		archive_names=("$ARCHIVES")
+	fi
+
+	for name in ${archive_names[@]}; do
+
+		inform-v "Checking archive $name..."
+
+		files=$(vfs ls $OUTDIR)
+		archive_files=$(grep -e "^$name" <<<"$files" | sort )
+
+		inform-v "Found Archives:"
+		inform-v "$archive_files"
+
+		declare -A lastmodified
+
+		for archive_file in $archive_files; do
+			inform "Reading last modification dates from $OUTDIR/$archive_file..."
+			while read perm user size date time path; do
+				lastmodified[$path]="$date-$time"
+			done < <( vfs cat $OUTDIR/$archive_file | gpg -q -d | tar -ztv )
+		done
+
+		inform-v "Comparing last modification dates..."
+
+		for path in "${!lastmodified[@]}"; do
+			backup="${lastmodified[$path]}"
+			! actual="$(date -d "@$(stat -c %Y "/$path")" +%Y-%m-%d-%H:%M)"
+			if [ "$backup" != "$actual" ]; then
+				error "/$path last modification time differs backup:$backup actual:$actual"
+			else
+				inform-vv "/$path is recent"
+			fi
+		done
+	done
+}
+
+upload() {
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			-*)
+				fail "Unknown parameter $1"
+				;;
+		esac
+	done
+
+	if ! grep '^sftp://' <<<"$MIRROR"; then
+		fail "Local mirror not implemented."
+	fi
+
+	inform "Starting upload..."
+
+	bash ${VERBOSE:+-v} <<-EOF
+	lftp -c "open $MIRROR; mirror --reverse --ignore-time --no-perms --verbose --continue --delete $OUTDIR ."
+	EOF
+
+	inform "Finished upload."
+}
+
+download() {
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-v|--verbose)
+				VERBOSE=1
+				shift
+				;;
+			-*)
+				fail "Unknown parameter $1"
+				;;
+		esac
+	done
+
+	inform "Starting download..."
+
+	bash ${VERBOSE:+-v} <<-EOF
+	lftp -c "open $MIRROR; mirror --ignore-time --no-perms --verbose --continue --delete . $OUTDIR"
+	EOF
+
+	inform "Finished download."
+}
+
+save+upload() {
+	save
+	upload
+}
+
+save+verify+upload() {
+	save
+	verify
+	upload
+}
+
+declare unparsed_args=()
+while [ $# -gt 0 ]; do
+	case $1 in
+		-V|--version)
+			echo $(basename $0) $VERSION;
+			exit
+			;;
+		-h|--help)
+			echo "$BASH_SOURCE [-h|--help] [-V|--version] [SUBCOMMAND]"
+			echo "$DESCRIPTION"
+			echo
+			echo "Where SUBCOMMAND is one of:"
+			echo "  save   [-v|--verbose]  [-t|--timestamp] [-f|--full] [-n|--dry-run] [-o|--output-directory PATH] [ARCHIVES]"
+			echo "  verify [-v|--verbose] [ARCHIVES]"
+			echo "  upload [-v|--verbose] "
+			echo "  download [-v|--verbose] "
+			echo "  save+upload"
+			echo "  save+verify+upload"
+			exit
+			;;
+		*)
+			unparsed_args+=("$1")
+			shift
+			;;
+	esac
+done
+set -- "${unparsed_args[@]}"
+
+case ${1:?Error: Missing subcommand.} in
+	save|verify|upload|download|save+upload|save+verify+upload)
+		"$@"
+		;;
+	*)
+		fail "Unknown command $1."
+		;;
+esac
